@@ -54,6 +54,7 @@ function collectGitData() {
   const data = {
     commits: [],
     prs: [],
+    stalePRs: [],
     reviews: [],
     comments: [],
     issues: [],
@@ -62,6 +63,7 @@ function collectGitData() {
     memberEvents: [],
   };
   const seenSHAs = new Set();
+  const commitBranches = new Map(); // SHA → Set of branch names
 
   for (const fullRepo of allRepos) {
     const repoName = fullRepo.split('/').pop();
@@ -86,7 +88,10 @@ function collectGitData() {
         if (!line) continue;
         const [sha, author, ...msgParts] = line.split('\t');
         const message = msgParts.join('\t');
-        if (!sha || seenSHAs.has(sha)) continue;
+        if (!sha) continue;
+        if (!commitBranches.has(sha)) commitBranches.set(sha, new Set());
+        commitBranches.get(sha).add(branch);
+        if (seenSHAs.has(sha)) continue;
         seenSHAs.add(sha);
         data.commits.push({
           repo: repoName,
@@ -102,6 +107,7 @@ function collectGitData() {
     // 2. PRs with reviews (created, merged, or closed in window)
     // Don't use updatedAt — bots (CI, Vercel, etc.) bump it constantly
     const prs = ghJSON(`pr list --repo "${fullRepo}" --state all --json number,title,author,state,createdAt,mergedAt,closedAt,reviews --limit 50`);
+    const seenPRNumbers = new Set();
     if (prs) {
       for (const pr of prs) {
         const inWindow = pr.createdAt >= since
@@ -109,6 +115,7 @@ function collectGitData() {
           || (pr.closedAt && pr.closedAt >= since);
         if (!inWindow) continue;
 
+        seenPRNumbers.add(pr.number);
         data.prs.push({
           repo: repoName,
           fullRepo,
@@ -121,6 +128,44 @@ function collectGitData() {
           closedAt: pr.closedAt?.slice(0, 10) || '',
           url: `https://github.com/${fullRepo}/pull/${pr.number}`,
         });
+
+        // Extract reviews submitted in the time window
+        for (const review of (pr.reviews || [])) {
+          if (review.submittedAt >= since && review.state !== 'PENDING') {
+            data.reviews.push({
+              repo: repoName,
+              prNumber: pr.number,
+              prTitle: pr.title,
+              reviewer: review.author?.login || 'unknown',
+              state: review.state,
+            });
+          }
+        }
+      }
+    }
+
+    // Also fetch all open PRs — to find stale ones and catch PRs with recent commits
+    const openPrs = ghJSON(`pr list --repo "${fullRepo}" --state open --json number,title,author,state,createdAt,reviews --limit 50`);
+    if (openPrs) {
+      for (const pr of openPrs) {
+        if (seenPRNumbers.has(pr.number)) continue;
+
+        const prData = {
+          repo: repoName,
+          fullRepo,
+          number: pr.number,
+          title: pr.title,
+          author: pr.author?.login || 'unknown',
+          state: pr.state,
+          createdAt: pr.createdAt?.slice(0, 10) || '',
+          mergedAt: '',
+          closedAt: '',
+          url: `https://github.com/${fullRepo}/pull/${pr.number}`,
+        };
+
+        // Check if this PR has commits in the window (matched later in formatRawData)
+        // For now, add to a separate list — will be promoted to active or flagged as stale
+        data.stalePRs.push(prData);
 
         // Extract reviews submitted in the time window
         for (const review of (pr.reviews || [])) {
@@ -245,70 +290,279 @@ function collectGitData() {
     return true;
   });
 
-  log(`Collected: ${data.commits.length} commits, ${data.prs.length} PRs, ${data.reviews.length} reviews, ${data.comments.length} comments, ${data.issues.length} issues, ${data.releases.length} releases, ${data.branchEvents.length} branch events, ${data.memberEvents.length} membership changes`);
+  // Fetch commit SHAs per PR (active + stale candidates) for accurate matching
+  log('Fetching commit SHAs per PR...');
+  const prCommitSHAs = new Map(); // "repo:#number" → Set of SHAs
+  for (const pr of [...data.prs, ...data.stalePRs]) {
+    const shas = gh(`api "repos/${pr.fullRepo}/pulls/${pr.number}/commits?per_page=100" --jq ".[].sha"`);
+    if (shas) {
+      prCommitSHAs.set(`${pr.repo}:#${pr.number}`, new Set(shas.split('\n').filter(Boolean)));
+    }
+  }
+  data._prCommitSHAs = prCommitSHAs;
+  data._commitBranches = commitBranches;
+
+  log(`Collected: ${data.commits.length} commits, ${data.prs.length} PRs, ${data.stalePRs.length} open PRs to check, ${data.reviews.length} reviews, ${data.comments.length} comments, ${data.issues.length} issues, ${data.releases.length} releases, ${data.branchEvents.length} branch events, ${data.memberEvents.length} membership changes`);
 
   return data;
 }
 
-function formatRawData(data, authorMap) {
+function formatRawData(data, authorMap, ticketPattern) {
   const n = (author) => authorMap[author] || author;
   const lines = [];
 
-  if (data.commits.length > 0) {
-    lines.push('COMMITS:');
-    for (const c of data.commits) {
-      lines.push(`[${c.repo}] ${n(c.author)} (${c.branch}): ${c.message} | ${c.url}`);
+  // SHA-based commit matching per PR
+  const prCommitSHAs = data._prCommitSHAs || new Map();
+  const commitBySHA = new Map();
+  for (const c of data.commits) {
+    const sha = c.url.split('/').pop();
+    commitBySHA.set(sha, c);
+  }
+
+  // Index reviews and comments by PR
+  const reviewsByPR = new Map();
+  for (const r of data.reviews) {
+    const key = `${r.repo}:#${r.prNumber}`;
+    if (!reviewsByPR.has(key)) reviewsByPR.set(key, []);
+    reviewsByPR.get(key).push(r);
+  }
+  const commentsByPR = new Map();
+  for (const c of data.comments) {
+    const key = `${c.repo}:#${c.issueNumber}`;
+    if (!commentsByPR.has(key)) commentsByPR.set(key, []);
+    commentsByPR.get(key).push(c);
+  }
+
+  // Group all data by person
+  const people = new Map();
+  const ensure = (author) => {
+    const name = n(author);
+    if (!people.has(name)) people.set(name, { prs: [], directCommits: [], releases: [], branches: [], issues: [] });
+    return people.get(name);
+  };
+
+  // Assign PRs to their authors, with reviews and comments attached
+  for (const pr of data.prs) {
+    const person = ensure(pr.author);
+    let status = pr.state;
+    if (pr.mergedAt) status = `MERGED ${pr.mergedAt}`;
+    else if (pr.closedAt) status = `CLOSED ${pr.closedAt}`;
+
+    const prKey = `${pr.repo}:#${pr.number}`;
+    const reviews = (reviewsByPR.get(prKey) || []).map(
+      (r) => `${n(r.reviewer)}: ${r.state}`
+    );
+    const comments = (commentsByPR.get(prKey) || []).map(
+      (c) => `${n(c.author)}: ${c.body}`
+    );
+
+    // Find commits that belong to this PR by SHA matching
+    const shas = prCommitSHAs.get(prKey) || new Set();
+    const prCommits = data.commits.filter((c) => {
+      const sha = c.url.split('/').pop();
+      return shas.has(sha);
+    });
+
+    person.prs.push({
+      repo: pr.repo,
+      number: pr.number,
+      title: pr.title,
+      status,
+      url: pr.url,
+      createdAt: pr.createdAt,
+      commits: prCommits.map((c) => `${c.message} | ${c.url}`),
+      reviews,
+      comments,
+    });
+  }
+
+  // Check stalePRs — promote to active if they have any recent activity, otherwise keep as stale
+  const remainingStalePRs = [];
+  for (const pr of data.stalePRs) {
+    const prKey = `${pr.repo}:#${pr.number}`;
+    const shas = prCommitSHAs.get(prKey) || new Set();
+    const prCommits = data.commits.filter((c) => {
+      const sha = c.url.split('/').pop();
+      return shas.has(sha);
+    });
+    const prReviews = reviewsByPR.get(prKey) || [];
+    const prComments = commentsByPR.get(prKey) || [];
+
+    const hasRecentActivity = prCommits.length > 0 || prReviews.length > 0 || prComments.length > 0;
+
+    if (hasRecentActivity) {
+      // Has recent activity — promote to active
+      const person = ensure(pr.author);
+      person.prs.push({
+        repo: pr.repo,
+        number: pr.number,
+        title: pr.title,
+        status: 'OPEN',
+        url: pr.url,
+        createdAt: pr.createdAt,
+        commits: prCommits.map((c) => `${c.message} | ${c.url}`),
+        reviews: prReviews.map((r) => `${n(r.reviewer)}: ${r.state}`),
+        comments: prComments.map((c) => `${n(c.author)}: ${c.body}`),
+      });
+    } else {
+      // No recent activity — stale
+      remainingStalePRs.push(pr);
     }
   }
 
-  if (data.prs.length > 0) {
-    lines.push('\nPULL REQUESTS:');
-    for (const pr of data.prs) {
-      let status = pr.state;
-      if (pr.mergedAt) status = `MERGED ${pr.mergedAt}`;
-      else if (pr.closedAt) status = `CLOSED ${pr.closedAt}`;
-      lines.push(`[${pr.repo}] [${status}] #${pr.number} ${pr.title} by ${n(pr.author)} | created:${pr.createdAt} | ${pr.url}`);
+  // Collect commit SHAs already assigned to PRs
+  const assignedCommitUrls = new Set();
+  for (const [, person] of people) {
+    for (const pr of person.prs) {
+      for (const c of pr.commits) {
+        assignedCommitUrls.add(c.split(' | ').pop());
+      }
     }
   }
 
-  if (data.reviews.length > 0) {
-    lines.push('\nPR REVIEWS:');
-    for (const r of data.reviews) {
-      lines.push(`[${r.repo}] PR #${r.prNumber}: ${n(r.reviewer)} → ${r.state}`);
+  // Direct pushes to main (commits not matched to any PR)
+  // Exclude merge/squash commits — they reference a PR number in the message e.g. "(#123)"
+  const knownPRNumbers = new Set();
+  for (const pr of [...data.prs, ...data.stalePRs]) {
+    knownPRNumbers.add(`${pr.repo}:#${pr.number}`);
+  }
+  const commitBranchesMap = data._commitBranches || new Map();
+  for (const c of data.commits) {
+    if (assignedCommitUrls.has(c.url)) continue;
+    const sha = c.url.split('/').pop();
+    const branches = commitBranchesMap.get(sha) || new Set();
+    if (branches.has('main') || branches.has('master')) {
+      // Check if this is a PR merge commit
+      // Matches: squash "title (#NNN)", merge "Merge pull request #NNN", or rebase with "(#NNN)"
+      const prRef = c.message.match(/\(#(\d+)\)/) || c.message.match(/^Merge pull request #(\d+)\b/);
+      if (prRef && knownPRNumbers.has(`${c.repo}:#${prRef[1]}`)) continue;
+
+      const person = ensure(c.author);
+      person.directCommits.push(`[${c.repo}] ${c.message} | ${c.url}`);
     }
   }
 
-  if (data.comments.length > 0) {
-    lines.push('\nCOMMENTS:');
-    for (const c of data.comments) {
-      const type = c.isReviewComment ? 'code review on' : 'commented on';
-      lines.push(`[${c.repo}] ${n(c.author)} ${type} #${c.issueNumber}: ${c.body}`);
-    }
+  // Issues — try to match to a PR by repo + similar number references, otherwise standalone
+  for (const issue of data.issues) {
+    const person = ensure(issue.author);
+    person.issues.push({
+      repo: issue.repo,
+      number: issue.number,
+      title: issue.title,
+      state: issue.state,
+      url: issue.url,
+    });
   }
 
-  if (data.issues.length > 0) {
-    lines.push('\nISSUES:');
-    for (const i of data.issues) {
-      lines.push(`[${i.repo}] [${i.state}] #${i.number} ${i.title} by ${n(i.author)} | ${i.url}`);
-    }
+  // Releases
+  for (const r of data.releases) {
+    const person = ensure(r.author);
+    person.releases.push(`[${r.repo}] ${r.tag} "${r.name}" | ${r.publishedAt} | ${r.url}`);
   }
 
-  if (data.releases.length > 0) {
-    lines.push('\nRELEASES:');
-    for (const r of data.releases) {
-      lines.push(`[${r.repo}] ${r.tag} "${r.name}" by ${n(r.author)} | ${r.publishedAt} | ${r.url}`);
-    }
+  // Branch events
+  for (const b of data.branchEvents) {
+    const person = ensure(b.author);
+    person.branches.push(`[${b.repo}] ${b.action} branch: ${b.branch}`);
   }
 
-  if (data.branchEvents.length > 0) {
-    lines.push('\nBRANCH EVENTS:');
-    for (const b of data.branchEvents) {
-      lines.push(`[${b.repo}] ${n(b.author)} ${b.action} branch: ${b.branch}`);
+  // Format output per person
+  for (const [name, person] of people) {
+    lines.push(`=== ${name} ===`);
+
+    for (const pr of person.prs) {
+      lines.push(`  PR #${pr.number}: ${pr.title} [${pr.status}] (${pr.repo}) | ${pr.url}`);
+      if (pr.commits.length > 0) {
+        // Group commits by ticket reference
+        const ticketRegex = ticketPattern ? new RegExp(ticketPattern, 'gi') : null;
+        const byTicket = new Map(); // ticket → [commit messages]
+        const noTicket = [];
+
+        for (const c of pr.commits) {
+          const msg = c.split(' | ')[0]; // commit message without URL
+          const url = c.split(' | ').slice(1).join(' | ');
+          const matches = ticketRegex ? msg.match(ticketRegex) : null;
+          if (matches) {
+            const ticket = matches[0].toUpperCase();
+            if (!byTicket.has(ticket)) byTicket.set(ticket, []);
+            byTicket.get(ticket).push({ msg, url });
+          } else {
+            noTicket.push({ msg, url });
+          }
+        }
+
+        for (const [ticket, commits] of byTicket) {
+          lines.push(`    ${ticket} (${commits.length} commits):`);
+          for (const c of commits) {
+            lines.push(`      ${c.msg} | ${c.url}`);
+          }
+        }
+        if (noTicket.length > 0) {
+          lines.push(`    Other commits (${noTicket.length}):`);
+          for (const c of noTicket) {
+            lines.push(`      ${c.msg} | ${c.url}`);
+          }
+        }
+      }
+      if (pr.reviews.length > 0) {
+        lines.push(`    Reviews: ${pr.reviews.join(', ')}`);
+      }
+      if (pr.comments.length > 0) {
+        lines.push(`    Comments:`);
+        for (const c of pr.comments) {
+          lines.push(`      ${c}`);
+        }
+      }
     }
+
+    if (person.directCommits.length > 0) {
+      lines.push(`  ⚠️ DIRECT PUSHES TO MAIN (${person.directCommits.length}):`);
+      for (const c of person.directCommits) {
+        lines.push(`    ${c}`);
+      }
+    }
+
+    if (person.issues.length > 0) {
+      lines.push(`  Issues:`);
+      for (const i of person.issues) {
+        lines.push(`    [${i.state}] #${i.number}: ${i.title} | ${i.url}`);
+      }
+    }
+
+    if (person.releases.length > 0) {
+      lines.push(`  Releases:`);
+      for (const r of person.releases) {
+        lines.push(`    ${r}`);
+      }
+    }
+
+    if (person.branches.length > 0) {
+      lines.push(`  Branches:`);
+      for (const b of person.branches) {
+        lines.push(`    ${b}`);
+      }
+    }
+
+    lines.push('');
   }
 
+  // Stale PRs — open with no recent activity, capped at 7
+  if (remainingStalePRs.length > 0) {
+    lines.push('=== STALE PRs (open, no recent activity) ===');
+    const shown = remainingStalePRs.slice(0, 7);
+    for (const pr of shown) {
+      const age = Math.floor((Date.now() - new Date(pr.createdAt).getTime()) / (1000 * 60 * 60 * 24));
+      lines.push(`  [${pr.repo}] #${pr.number}: ${pr.title} by ${n(pr.author)} — open ${age} days | ${pr.url}`);
+    }
+    if (remainingStalePRs.length > 7) {
+      lines.push(`  ... and ${remainingStalePRs.length - 7} more stale PRs`);
+    }
+    lines.push('');
+  }
+
+  // Membership changes (org-level, not person-specific)
   if (data.memberEvents.length > 0) {
-    lines.push('\nMEMBERSHIP CHANGES:');
+    lines.push('=== MEMBERSHIP CHANGES ===');
     for (const m of data.memberEvents) {
       lines.push(`[${m.repo}] ${n(m.member)} was ${m.action} by ${n(m.actor)}`);
     }
@@ -329,20 +583,17 @@ Author mapping: ${authorMapStr}
 
 ${rawData}
 
-TASK: Organize ALL activity by person (use display names from mapping). For each person, list:
+TASK: Organize ALL activity by person (use display names from mapping). The data is already grouped by person and PR-centric. For each person:
 
-1. COMMITS: repos worked on with commit count and key themes (1 short sentence per repo). Include branch name and one representative commit URL per repo.
-2. PRs: opened, merged, closed, or reviewed. Include PR number, title, state, and URL.
-3. REVIEWS: which PRs they reviewed and the verdict (approved, changes requested, commented).
-4. COMMENTS: what they commented on (issue/PR number and brief topic).
-5. ISSUES: issues they opened or closed.
-6. RELEASES: any releases they published.
-7. BRANCHES: branches they created or deleted.
-
-Also note:
-- ${ticketPattern ? `Ticket references (${ticketPattern} patterns from commit messages or PR titles)` : 'Any ticket references from commit messages or PR titles'}
-- Dominant repo if one has significantly more activity
-- Any membership changes
+1. PRs are the primary unit. Each PR should show: number, title, state, repo, URL.
+   - Commits belonging to the PR are listed under it — summarize into themes with count.
+   - Reviews on the PR are listed under it — who reviewed and verdict.
+   - Comments on the PR are listed under it — summarize the discussion briefly.
+   ${ticketPattern ? `- Connect PRs to tickets: if a ${ticketPattern} pattern appears in the PR title, branch, or commits, note the ticket. If no explicit ticket reference exists but the PR clearly relates to a known ticket based on its content, note it with "(AI-matched)".` : ''}
+   - If no ticket reference can be found or inferred for a PR, flag with "⚠️ no ticket linked".
+2. Direct pushes to main are flagged separately — these should be called out.
+3. Issues should be connected to the PR they're addressed by if possible.
+4. Releases and branch events listed after PRs.
 
 Output ONLY the structured data — no commentary, no formatting instructions. Keep it concise but complete. Use plain text, not markdown.`;
 
@@ -371,7 +622,7 @@ Output ONLY the structured data — no commentary, no formatting instructions. K
 // --- Final LLM call: generate Slack message ---
 
 function generateSlackSummary(structuredData, isPreprocessed) {
-  const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
   const ticketPattern = CONFIG.ticketPattern || '';
   const llmCommand = CONFIG.llmCommand || 'claude -p -';
 
@@ -384,7 +635,7 @@ function generateSlackSummary(structuredData, isPreprocessed) {
 
   const prompt = `You are a dev activity summarizer. Generate a Slack daily summary from this ${isPreprocessed ? 'pre-organized' : 'raw'} data.
 ${contextBlock}
-Date: ${today}
+Date: ${yesterday}
 
 ${dataLabel}:
 ${structuredData}
@@ -392,18 +643,26 @@ ${structuredData}
 FORMAT RULES:
 - Use Slack mrkdwn (*bold*, _italic_, \`code\`)
 - For links use Slack format: <URL|display text>
-- Start with: *Daily Dev Summary — ${today}*
-- Group by person — under each person, show a short bullet list of all their activity (commits, PRs, reviews, comments, issues, releases, branches)
-- For commits: summarize into one bullet per repo with commit count in parentheses. Include branch name as a clickable compare link (<https://github.com/ORG/REPO/compare/main...BRANCH|branch>)
-- If most commits are in one dominant repo, note it once at top (_Most activity in <repo_url|repo>_) and only label bullets for other repos
-- For PRs: show state (opened, merged, closed). Link PR number: <pr_url|repo #number>. Split into *New PRs* vs *Open PRs* if both exist, otherwise just *PRs:*
-- For reviews: mention what they reviewed and the verdict (approved, changes requested)
-- For comments: briefly note what they commented on (don't quote full comments)
-- For issues: show opened/closed status
-- For releases: show tag and release name
-- For branches: mention created/deleted
-- For membership changes: note who was added/removed
-${ticketPattern ? `- Add *Tickets mentioned:* if any ${ticketPattern} patterns appear` : ''}
+- Start with: *Daily Dev Summary — ${yesterday}*
+- Group by person. Format per person:
+  *Person Name*
+  <pr_url|*repo #number*> — *Title* — \`state\`${ticketPattern ? ` — link to ticket if ${ticketPattern} pattern found in PR title/branch/commits. If no explicit reference but the PR clearly relates to a known ticket based on context, note it with _(AI-matched)_.` : ''} If no ticket reference can be found or inferred for a PR, flag with ⚠️ _no ticket linked_
+  • Commit summary (count + brief theme). Every PR MUST have at least one bullet underneath — if no commits, summarize recent activity (comments, reviews) or briefly describe what the PR does.
+  • Reviews: who reviewed + verdict (only if applicable)
+  • Discussion summary (only if applicable)
+  (next PR for same person follows directly)
+  ───────────────
+  (divider AFTER each person's section, before the next person)
+- PRs are plain lines (no bullet). Sub-items (commits, reviews, discussion) are bullet points (•) indented under the PR.
+- Commits are grouped by ticket reference in the data. Distinguish between:
+  a) The PR's *target ticket* — the ticket the PR is actually working on (typically in the PR title or referenced by most commits). Show as the PR's ticket on the PR line.
+  b) *Referenced tickets* — mentioned in a commit as context but not the focus of this PR. Show as a brief mention: "references TICKET" — do NOT say "X commits for TICKET" if the PR isn't working on that ticket.
+  Show each distinct group of commits as a separate bullet with count + summary. Do NOT merge all commits into one line.
+- After PRs, if the person pushed directly to main, flag with ⚠️: *Direct pushes to main:* — summarize what was pushed
+- Releases and branch events as separate bullets after PRs
+- Reviews appear ONLY under the PR author's section (not duplicated under the reviewer). Mention who reviewed.
+- Issues should be connected to the PR that addresses them, not listed separately
+- If there are stale PRs (open with no recent activity), add a *🕸 Stale PRs:* section at the end — list each with repo, PR number+link, title, author, and age in days
 - End with a *Notable:* line — one sentence on the main theme of the day
 - Omit sections that would be empty
 - Output ONLY the Slack message — no code blocks, no explanation, no prefix/suffix`;
@@ -441,7 +700,8 @@ async function main() {
   }
 
   const authorMap = CONFIG.authorMap || {};
-  const rawData = formatRawData(data, authorMap);
+  const ticketPattern = CONFIG.ticketPattern || '';
+  const rawData = formatRawData(data, authorMap, ticketPattern);
 
   // Step 2: Gemini Flash pre-processing (optional — only if OPENROUTER_API_KEY is set)
   const openrouterApiKey = process.env.OPENROUTER_API_KEY;
