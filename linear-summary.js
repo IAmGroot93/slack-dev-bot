@@ -31,13 +31,13 @@ ${formattedData}
 
 TASK: Organize this data into a concise structured format grouped by ticket:
 1. For each ticket: identifier, title, assignee (use display names from mapping), current status.
-2. If the ticket has comments/discussions, summarize the key points or decisions in 1-2 sentences. This is the most valuable part — discussions are easy to miss in Linear.
-3. Quote specific decisions or action items from comments if present.
-4. Separate new tickets (just created) from updated existing tickets.
-5. Note any status changes (e.g. moved from Todo to In Progress).
+2. Preserve status transition chains (e.g. "Todo → In Progress → In Review") and assignment changes as provided.
+3. If the ticket has comments/discussions, summarize the key points, decisions, or findings in 1-2 sentences. Distill the discussion — do not copy comments verbatim. This is the most valuable part — discussions are easy to miss in Linear.
+4. Highlight specific decisions or action items from comments if present.
+5. Separate new tickets (just created, still in Backlog/Todo), discussed tickets (Backlog/Todo with recent activity), and active tickets (being worked on).
 6. Identify main themes or patterns across all ticket activity.
 
-Output ONLY the structured data — no commentary, no formatting instructions. Keep it concise but preserve discussion details. Use plain text, not markdown.`;
+Output ONLY the structured data — no commentary, no formatting instructions. Keep it concise but preserve discussion details and transition chains. Use plain text, not markdown.`;
 
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
@@ -64,14 +64,14 @@ Output ONLY the structured data — no commentary, no formatting instructions. K
 // --- Final LLM: Slack message ---
 
 function generateSlackSummary(structuredData, isPreprocessed) {
-  const today = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
   const llmCommand = CONFIG.llmCommand || 'claude -p -';
   const linearOrg = CONFIG.linearOrg || 'your-org';
   const dataLabel = isPreprocessed ? 'ORGANIZED LINEAR DATA' : 'RAW LINEAR DATA';
 
   const prompt = `You are a Linear ticket activity summarizer. Generate a concise Slack summary from this ${isPreprocessed ? 'pre-organized' : 'raw'} Linear data.
 
-Date: ${today}
+Activity from: ${yesterday}
 
 ${dataLabel}:
 ${structuredData}
@@ -79,15 +79,19 @@ ${structuredData}
 FORMAT RULES:
 - Use Slack mrkdwn (*bold*, _italic_, \`code\`)
 - For links use Slack format: <URL|display text>
-- Start with: *Linear Activity — ${today}*
+- Start with: *Linear Activity — ${yesterday}*
 - Group by ticket (not by person — Linear is ticket-centric)
-- For each ticket line, format as: <linear_url|IDENTIFIER> — Title — *Assignee* \`Status\`
-  - Assignee must be *bold* so it's immediately visible
-  - Status must be in \`inline code\` (e.g. \`Todo\`, \`In Progress\`, \`Done\`) so it stands out visually
 - Link ticket identifiers to Linear: <https://linear.app/${linearOrg}/issue/IDENTIFIER|IDENTIFIER>
-- Emphasize *comments and discussions* — these are the most valuable part (easy to miss in Linear)
-- Quote key discussion points or decisions from comments (keep brief)
+- Standard ticket format (3 lines):
+  Line 1: <linear_url|IDENTIFIER> — Title
+  Line 2: *Assignee* \`Status\` [Priority] — include status transition chain if available (e.g. \`Todo\` → \`In Progress\` → \`In Review\`) and assignment changes (e.g. *Alice* → *Bob*)
+  Line 3 (only if comments exist): Brief summary of the discussion — summarize key decisions, findings, or action items in your own words. Do NOT quote comments verbatim. Distill multi-message threads into a single concise takeaway.
+- Assignee must be *bold*, status in \`inline code\`
+- For Completed and Canceled/Duplicate sections: simplify — ONLY show ticket link + title on one line. No assignee, no status, no transition chain — the section heading already conveys the status. Only add a second line if there was a notable discussion worth mentioning.
+- For On Hold section: show ticket link + title + assignee, but status is implied by the section. Include a note if there is context on why it was put on hold.
+- Emphasize *comments and discussions* — these are the most valuable part (easy to miss in Linear). Summarize them, don't copy them.
 - Add a *Highlights:* section at the end — 1-2 sentences on the main themes or important discussions
+- Order sections: New tickets → Discussed (Backlog/Todo with recent activity) → Active/In Progress → QA/Testing → On hold → Completed → Canceled/Duplicate
 - Omit sections that would be empty
 - Output ONLY the Slack message — no code blocks, no explanation, no prefix/suffix`;
 
@@ -127,11 +131,10 @@ async function main() {
   log(`Fetching Linear activity for last ${lookbackHours}h...`);
   const data = await fetchLinearActivity(apiKey, teamId, lookbackHours);
 
-  const totalIssues = data.newIssues.length + data.activeIssues.length;
-  const totalComments = data.recentComments.length;
-  log(`Found ${data.newIssues.length} new issues, ${data.activeIssues.length} updated issues, ${totalComments} comments`);
+  const totalIssues = data.newIssues.length + data.discussedIssues.length + data.activeIssues.length;
+  log(`Found ${data.newIssues.length} new issues, ${data.discussedIssues.length} discussed issues, ${data.activeIssues.length} active issues`);
 
-  if (totalIssues === 0 && totalComments === 0) {
+  if (totalIssues === 0) {
     log('No Linear activity found. Skipping summary.');
     process.exit(0);
   }
