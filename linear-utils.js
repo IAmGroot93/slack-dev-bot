@@ -37,7 +37,7 @@ async function fetchLinearActivity(apiKey, teamId, sinceHours = 24) {
                 user { name displayName }
               }
             }
-            history(first: 10) {
+            history(last: 10, orderBy: createdAt) {
               nodes {
                 createdAt
                 fromState { name }
