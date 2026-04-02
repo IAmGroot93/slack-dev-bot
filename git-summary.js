@@ -290,10 +290,31 @@ function collectGitData() {
     return true;
   });
 
-  // Fetch commit SHAs per PR (active + stale candidates) for accurate matching
-  log('Fetching commit SHAs per PR...');
+  // Fetch commit SHAs per PR for accurate matching
+  // For stale PRs, only fetch if the PR has recent activity (reviews/comments) or
+  // the author has recent non-main commits (could match the PR)
+  const stalePRsWithReviewOrComment = new Set();
+  for (const r of data.reviews) {
+    stalePRsWithReviewOrComment.add(`${r.repo}:#${r.prNumber}`);
+  }
+  for (const c of data.comments) {
+    stalePRsWithReviewOrComment.add(`${c.repo}:#${c.issueNumber}`);
+  }
+  const authorsWithBranchCommits = new Set();
+  for (const c of data.commits) {
+    const sha = c.url.split('/').pop();
+    const branches = commitBranches.get(sha) || new Set();
+    const onlyMain = branches.size === 1 && (branches.has('main') || branches.has('master'));
+    if (!onlyMain) authorsWithBranchCommits.add(c.author);
+  }
+  const stalePRsToFetch = data.stalePRs.filter((pr) =>
+    stalePRsWithReviewOrComment.has(`${pr.repo}:#${pr.number}`) ||
+    authorsWithBranchCommits.has(pr.author)
+  );
+  const prsToFetch = [...data.prs, ...stalePRsToFetch];
+  log(`Fetching commit SHAs for ${prsToFetch.length} PRs (${data.prs.length} active + ${stalePRsToFetch.length} stale candidates, skipping ${data.stalePRs.length - stalePRsToFetch.length} inactive stale)...`);
   const prCommitSHAs = new Map(); // "repo:#number" → Set of SHAs
-  for (const pr of [...data.prs, ...data.stalePRs]) {
+  for (const pr of prsToFetch) {
     const shas = gh(`api "repos/${pr.fullRepo}/pulls/${pr.number}/commits?per_page=100" --jq ".[].sha"`);
     if (shas) {
       prCommitSHAs.set(`${pr.repo}:#${pr.number}`, new Set(shas.split('\n').filter(Boolean)));
@@ -313,11 +334,6 @@ function formatRawData(data, authorMap, ticketPattern) {
 
   // SHA-based commit matching per PR
   const prCommitSHAs = data._prCommitSHAs || new Map();
-  const commitBySHA = new Map();
-  for (const c of data.commits) {
-    const sha = c.url.split('/').pop();
-    commitBySHA.set(sha, c);
-  }
 
   // Index reviews and comments by PR
   const reviewsByPR = new Map();
@@ -337,7 +353,7 @@ function formatRawData(data, authorMap, ticketPattern) {
   const people = new Map();
   const ensure = (author) => {
     const name = n(author);
-    if (!people.has(name)) people.set(name, { prs: [], directCommits: [], releases: [], branches: [], issues: [] });
+    if (!people.has(name)) people.set(name, { prs: [], directCommits: [], unlinkedCommits: [], releases: [], branches: [], issues: [] });
     return people.get(name);
   };
 
@@ -442,6 +458,18 @@ function formatRawData(data, authorMap, ticketPattern) {
     }
   }
 
+  // Unlinked branch commits — on a non-main branch but not matched to any PR
+  for (const c of data.commits) {
+    if (assignedCommitUrls.has(c.url)) continue;
+    const sha = c.url.split('/').pop();
+    const branches = commitBranchesMap.get(sha) || new Set();
+    // Skip if already handled as direct push to main
+    const onMain = branches.has('main') || branches.has('master');
+    if (onMain) continue;
+    const person = ensure(c.author);
+    person.unlinkedCommits.push(`[${c.repo}] (${[...branches][0]}) ${c.message} | ${c.url}`);
+  }
+
   // Issues — try to match to a PR by repo + similar number references, otherwise standalone
   for (const issue of data.issues) {
     const person = ensure(issue.author);
@@ -518,6 +546,13 @@ function formatRawData(data, authorMap, ticketPattern) {
     if (person.directCommits.length > 0) {
       lines.push(`  ⚠️ DIRECT PUSHES TO MAIN (${person.directCommits.length}):`);
       for (const c of person.directCommits) {
+        lines.push(`    ${c}`);
+      }
+    }
+
+    if (person.unlinkedCommits.length > 0) {
+      lines.push(`  ❓ COMMITS ON BRANCHES WITHOUT A PR (${person.unlinkedCommits.length}):`);
+      for (const c of person.unlinkedCommits) {
         lines.push(`    ${c}`);
       }
     }
